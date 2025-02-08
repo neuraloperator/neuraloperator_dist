@@ -6,7 +6,109 @@ import pathlib
 from .callbacks import PipelineCallback
 import neuralop.mpu.comm as comm
 from neuralop.losses import LpLoss
+import math
 
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
+
+def ensure_divisibility(numerator: int, denominator: int) -> None:
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+    
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+    
+def split_tensor(
+    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
+) -> List[torch.Tensor]:
+    """ Split a tensor along its last dimension.
+
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
+
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    dim_size = divide(tensor.size()[dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+def _split_along_last_dim(input_):
+    """Split the tensor along its first dimension and keep the
+    corresponding slice."""
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    input_list = split_tensor(input_, world_size, dim=-2)
+
+    output = input_list[rank].contiguous()
+
+    return output
+
+def _gather_along_last_dim(input_):
+    """Gather tensors and concatinate along the first dimension."""
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    torch.distributed.all_gather_into_tensor(
+        output, input_.contiguous(), group=group
+    )
+    tensor_list = output.chunk(world_size, dim=0)
+    output = torch.cat(tensor_list, dim=-2).contiguous()
+
+    return output
+    
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """Gather the input from model parallel region and concatinate."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather_along_last_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather_along_last_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _split_along_last_dim(grad_output)
 
 class Trainer:
     def __init__(self, *, 
@@ -125,6 +227,15 @@ class Trainer:
 
         errors = None
 
+        
+        try:
+            group = torch.distributed.distributed_c10d._get_default_group()
+            rank = torch.distributed.get_rank(group=group)
+            world_size = torch.distributed.get_world_size(group=group)
+        except:
+            rank = 0
+            world_size = 1
+
         for epoch in range(self.n_epochs):
 
             if self.callbacks:
@@ -137,7 +248,8 @@ class Trainer:
             train_err = 0.0
 
             for idx, sample in enumerate(train_loader):
-
+                
+                
                 if self.callbacks:
                     self.callbacks.on_batch_start(idx=idx, sample=sample)
 
@@ -151,11 +263,26 @@ class Trainer:
                     # load data to device if no preprocessor exists
                     sample = {k:v.to(self.device) for k,v in sample.items() if torch.is_tensor(v)}
 
+                
+                # sample['x'] = sample['x'].repeat_interleave(8, dim=2).repeat_interleave(8, dim=3)
+                # sample['y'] = sample['y'].repeat_interleave(8, dim=2).repeat_interleave(8, dim=3)
+                # print(sample['x'].shape, sample['y'].shape)
+                
+                b, c, h, w = sample['x'].size()
+                chunk_size = math.ceil(h / world_size)
+                sample['x'] = list(sample['x'].split(chunk_size, dim=2))[rank]
+                # sample['y'] = list(sample['y'].split(chunk_size, dim=2))[rank]
+
                 if self.amp_autocast:
                     with amp.autocast(enabled=True):
                         out  = self.model(**sample)
                 else:
                     out  = self.model(**sample)
+
+                out = _GatherFromModelParallelRegion.apply(out)
+
+                # print(out[0][0], out.shape)
+                # exit()
 
                 if self.data_processor is not None:
                     out, sample = self.data_processor.postprocess(out, sample)
@@ -185,10 +312,19 @@ class Trainer:
                 
                 if regularizer:
                     loss += regularizer.loss
+
+                # torch.distributed.all_reduce(loss, group=group)
+                # loss.div_(world_size)
+                # print(loss)
+                # exit()
                 
                 loss.backward()
                 del out
 
+                # for param_name, param in self.model.named_parameters():
+                #     if rank == 0:
+                #         print(param_name, param.shape, param.grad.view(-1)[0])
+                # exit()
                 optimizer.step()
                 train_err += loss.item()
         

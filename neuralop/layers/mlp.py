@@ -58,6 +58,7 @@ class MLP(nn.Module):
                 self.fcs.append(Conv(self.hidden_channels, self.hidden_channels, 1))
 
     def forward(self, x):
+        
         for i, fc in enumerate(self.fcs):
             x = fc(x)
             if i < self.n_layers - 1:

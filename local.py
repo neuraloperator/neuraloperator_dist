@@ -21,6 +21,8 @@ from neuralop import LpLoss, H1Loss
 
 device = 'cuda'
 
+import numpy as np
+
 
 # %%
 # Loading the Navier-Stokes dataset in 128x128 resolution
@@ -36,6 +38,9 @@ data_processor = data_processor.to(device)
 # %%
 # We create a tensorized FNO model
 
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+np.random.seed(42)
 model = TFNO(n_modes=(16, 16), hidden_channels=32, projection_channels=64, factorization='tucker', rank=0.42)
 model = model.to(device)
 

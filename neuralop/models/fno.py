@@ -243,7 +243,7 @@ class FNO(BaseModel, name='FNO'):
             output_shape = [None]*self.n_layers
         elif isinstance(output_shape, tuple):
             output_shape = [None]*(self.n_layers - 1) + [output_shape]
-
+        
         x = self.lifting(x)
 
         if self.domain_padding is not None:

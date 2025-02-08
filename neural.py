@@ -15,122 +15,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from fairscale.nn.data_parallel import FullyShardedDataParallel
 
 import torch
-import numpy as np
 
 import argparse
-import math
 
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    Generator,
-    Iterator,
-    List,
-    Mapping,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+import numpy as np
 
-def ensure_divisibility(numerator: int, denominator: int) -> None:
-    """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
-    
-def divide(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator and return
-    the division value."""
-    ensure_divisibility(numerator, denominator)
-    return numerator // denominator
-    
-def split_tensor(
-    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
-) -> List[torch.Tensor]:
-    """ Split a tensor along its last dimension.
-
-        Arguments:
-            tensor: input tensor.
-            num_partitions: number of partitions to split the tensor
-            contiguous_split_chunks: If True, make each chunk contiguous
-                                     in memory.
-
-        Returns:
-            A list of Tensors
-    """
-    # Get the size and dimension.
-    dim_size = divide(tensor.size()[dim], num_partitions)
-    # Split.
-    tensor_list = torch.split(tensor, dim_size, dim=dim)
-    # Note: torch.split does not create contiguous tensors by default.
-    if contiguous_split_chunks:
-        return tuple(chunk.contiguous() for chunk in tensor_list)
-
-    return tensor_list
-
-def _split_along_last_dim(input_):
-    """Split the tensor along its first dimension and keep the
-    corresponding slice."""
-    group = torch.distributed.distributed_c10d._get_default_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    rank = torch.distributed.get_rank(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    input_list = split_tensor(input_, world_size, dim=-2)
-
-    output = input_list[rank].contiguous()
-
-    return output
-
-def _gather_along_last_dim(input_):
-    """Gather tensors and concatinate along the first dimension."""
-
-    group = torch.distributed.distributed_c10d._get_default_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    dim_size = list(input_.size())
-    dim_size[-2] = dim_size[-2] * world_size
-
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    torch.distributed._all_gather_base(
-        output, input_.contiguous(), group=group
-    )
-
-    return output
-    
-class _GatherFromModelParallelRegion(torch.autograd.Function):
-    """Gather the input from model parallel region and concatinate."""
-
-    @staticmethod
-    def symbolic(graph, input_):
-        return _gather_along_last_dim(input_)
-
-    @staticmethod
-    def forward(ctx, input_):
-        return _gather_along_last_dim(input_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _split_along_last_dim(grad_output)
-
-def init_random_seed(seed: int):
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-    
 def benchmark(rank, args, world_size):
     print(rank)
     device = 'cuda'
-
-    init_random_seed(42)
     
     RPC_PORT = 29501
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -147,33 +39,18 @@ def benchmark(rank, args, world_size):
     )
     data_processor = data_processor.to(device)
     
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    np.random.seed(42)
+    
     model = TFNO(n_modes=(16, 16), hidden_channels=32, projection_channels=64, factorization='tucker', rank=0.42)
     # model = TFNO(n_modes=(128, 128), hidden_channels=256, projection_channels=512, factorization='tucker', rank=0.42)
     model = model.to(device)
-
-    optimizer_dict = {}
-    # def optimizer_hook2(parameter) -> None:
-    #     print('-------------------', optimizer_dict[parameter], parameter.shape, parameter.grad.view(-1)[0])
-        
-    def optimizer_hook(parameter) -> None:
-        dist.all_reduce(parameter.grad)
-        # print('-------------------', optimizer_dict[parameter], parameter.shape, parameter.grad.view(-1)[0])
     
     for param_name, param in model.named_parameters():
         print(param_name, param.shape)
-        optimizer_dict[param] = param_name
 
-        param.register_post_accumulate_grad_hook(optimizer_hook)
-    
-        # if not 'fno_blocks' in param_name:
-        #     print('no-------------------',param_name)
-        #     param.register_post_accumulate_grad_hook(optimizer_hook)
-        # else:
-        #     param.register_post_accumulate_grad_hook(optimizer_hook2)
-            
-
-    print(model)
-    # model = DDP(model)
+    model = DDP(model)
     
     n_params = count_model_params(model)
     print(f'\nOur model has {n_params} parameters.')
@@ -198,7 +75,7 @@ def benchmark(rank, args, world_size):
     print(f'\n * Test: {eval_losses}')
     sys.stdout.flush()
     
-    trainer = Trainer(model=model, n_epochs=100,
+    trainer = Trainer(model=model, n_epochs=20,
                       device=device,
                       data_processor=data_processor,
                       wandb_log=False,
@@ -226,6 +103,7 @@ def benchmark(rank, args, world_size):
 
     test_samples = test_loaders[32].dataset
 
+    model.eval()
     fig = plt.figure(figsize=(7, 7))
     for index in range(3):
         data = test_samples[index]
@@ -235,13 +113,7 @@ def benchmark(rank, args, world_size):
         # Ground-truth
         y = data['y']
         # Model prediction
-
-        print(x.shape)
-        c, h, w = x.size()
-        chunk_size = math.ceil(h / world_size)
-        x = list(x.split(chunk_size, dim=1))[rank]
         out = model(x.unsqueeze(0))
-        out = _GatherFromModelParallelRegion.apply(out)
 
         ax = fig.add_subplot(3, 3, index*3 + 1)
         ax.imshow(x[0].cpu(), cmap='gray')

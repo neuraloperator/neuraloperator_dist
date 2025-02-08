@@ -13,6 +13,9 @@ from .einsum_utils import einsum_complexhalf
 from .base_spectral_conv import BaseSpectralConv
 from .resample import resample
 
+import math
+import torch.distributed as dist
+
 tl.set_backend("pytorch")
 use_opt_einsum("optimal")
 einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -181,6 +184,181 @@ def get_contract_fun(weight, implementation="reconstructed", separable=False):
 
 Number = Union[int, float]
 
+def _gather_along_last_dim(input_):
+    """Gather tensors and concatinate along the first dimension."""
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    torch.distributed.all_gather_into_tensor(
+        output, input_.contiguous(), group=group
+    )
+    tensor_list = output.chunk(world_size, dim=0)
+    output = torch.cat(tensor_list, dim=1).contiguous()
+
+    return output
+    
+def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
+    """Reduce-scatter the input tensor across model parallel group.
+
+    Args:
+        input_ (torch.Tensor): The input tensor to be reduce-scattered.
+        input_split_sizes (List[int], optional): A list specifying the sizes of
+            the input splits along the first dimension for each rank. If None,
+            equal splitting is assumed. Default: None.
+    """
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    if input_split_sizes is None:
+        dim_size = list(input_.size())
+        assert (
+            dim_size[0] % world_size == 0
+        ), "First dimension of the tensor should be divisible by tensor parallel size"
+
+        dim_size[0] = dim_size[0] // world_size
+
+        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        torch.distributed._reduce_scatter_base(
+            output, input_.contiguous(), group=group
+        )
+    else:
+        rank = torch.distributed.get_rank(group)
+        input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
+        output = torch.empty_like(input_tensor_list[rank])
+        torch.distributed.reduce_scatter(
+            output, input_tensor_list, group=group
+        )
+    return output
+    
+def _reduce_scatter_along_last_dim(input_):
+    """Reduce-scatter tensors on the last dimension."""
+    
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    
+    target_shape = list(input_.size())
+    target_shape[1] = target_shape[1] // world_size
+    input_ = input_.reshape(-1, input_.shape[1])
+    split_tensors = torch.split(
+        input_, split_size_or_sections=input_.shape[1] // world_size, dim=1
+    )
+    concat_tensor = torch.cat(split_tensors, dim=0)
+    output = _reduce_scatter_along_first_dim(concat_tensor).reshape(target_shape)
+    return output
+
+
+class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        """Symbolic function for tracing."""
+        return _reduce_scatter_along_last_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        """Forward function."""
+        return _reduce_scatter_along_last_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        return _gather_along_last_dim(grad_output)
+
+def _reduce(input_):
+    """All-reduce the input tensor across model parallel group."""
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    # All-reduce.
+    input_ = input_.contiguous()
+    torch.distributed.all_reduce(input_, group=group)
+
+    return input_
+
+def ensure_divisibility(numerator: int, denominator: int) -> None:
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+    
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+    
+def split_tensor(
+    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
+) -> List[torch.Tensor]:
+    """ Split a tensor along its last dimension.
+
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
+
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    dim_size = divide(tensor.size()[dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+def _split_along_last_dim(input_):
+    """Split the tensor along its first dimension and keep the
+    corresponding slice."""
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    input_list = split_tensor(input_, world_size, dim=1)
+
+    output = input_list[rank].contiguous()
+
+    return output
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """All-reduce the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        """Symbolic function for tracing."""
+        return _split_along_last_dim(_reduce(input_))
+
+    @staticmethod
+    def forward(ctx, input_):
+        """Forward function."""
+        print('----------------------')
+        return _split_along_last_dim(_reduce(input_))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        return _gather_along_last_dim(grad_output)
 
 class SpectralConv(BaseSpectralConv):
     """Generic N-Dimensional Fourier Neural Operator
@@ -278,6 +456,11 @@ class SpectralConv(BaseSpectralConv):
         # n_modes is the total number of modes kept along each dimension
         self.n_modes = n_modes
         self.order = len(self.n_modes)
+
+        
+        self.group = dist.group.WORLD
+        self.world_size = dist.get_world_size(self.group)
+        self.local_rank = dist.get_rank(self.group)
 
         if max_n_modes is None:
             max_n_modes = self.n_modes
@@ -446,17 +629,46 @@ class SpectralConv(BaseSpectralConv):
             out_dtype = torch.cfloat
         out_fft = torch.zeros([batchsize, self.out_channels, *fft_size],
                               device=x.device, dtype=out_dtype)
+
+        weight = self._get_weight(indices)
+
+        channels = x.shape[1]
+        
         starts = [(max_modes - min(size, n_mode)) for (size, n_mode, max_modes) in zip(fft_size, self.n_modes, self.max_n_modes)]
-        slices_w =  [slice(None), slice(None)] # Batch_size, channels
+        slices_w =  [slice(channels * self.local_rank, channels * (self.local_rank + 1)), slice(None)] # Batch_size, channels
+        # slices_w =  [slice(None), slice(None)] # Batch_size, channels
         slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts[:-1]]
         slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)] # The last mode already has redundant half removed
-        weight = self._get_weight(indices)[slices_w]
+
+        
+        print(weight.shape)
+        # print(slices_w, self.n_modes, self.max_n_modes, starts)
+        weight = weight[slices_w]
+        # print(weight)
 
         starts = [(size - min(size, n_mode)) for (size, n_mode) in zip(list(x.shape[2:]), list(weight.shape[2:]))]
         slices_x =  [slice(None), slice(None)] # Batch_size, channels
         slices_x += [slice(start//2, -start//2) if start else slice(start, None) for start in starts[:-1]]
         slices_x += [slice(None, -starts[-1]) if starts[-1] else slice(None)] # The last mode already has redundant half removed
-        out_fft[slices_x] = self._contract(x[slices_x], weight, separable=False)
+
+        
+        # out_fft[slices_x] = self._contract(x[slices_x], weight, separable=False)
+        out_fft = self._contract(x[slices_x], weight, separable=False)
+
+        # out_fft = torch.view_as_real(out_fft.contiguous())
+        # print(out_fft.shape)
+        # out_fft = _ReduceScatterToTensorParallelRegion.apply(out_fft)
+        # print(out_fft.shape)
+        # out_fft = torch.view_as_complex(out_fft)
+        # out_fft = out_fft.contiguous()
+        # dist.all_reduce(out_fft)
+        # out_fft = out_fft[:, channels * self.local_rank : channels * (self.local_rank + 1), :, :]
+
+        out_fft = _ReduceFromModelParallelRegion.apply(out_fft)
+
+        # print(out_fft[0][0])
+        # exit(0)
+
 
         if self.output_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.output_scaling_factor[indices])])
@@ -469,7 +681,8 @@ class SpectralConv(BaseSpectralConv):
         x = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
 
         if self.bias is not None:
-            x = x + self.bias[indices, ...]
+            x = x + self.bias[indices, ...][channels * self.local_rank : channels * (self.local_rank + 1)]
+            # x = x + self.bias[indices, ...]
 
         return x
 
