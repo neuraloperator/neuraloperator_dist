@@ -1,156 +1,176 @@
-.. image:: https://img.shields.io/pypi/v/neuraloperator
-   :target: https://pypi.org/project/neuraloperator/
-   :alt: PyPI
+[![PyPI](https://img.shields.io/pypi/v/neuraloperator)](https://pypi.org/project/neuraloperator/)
+[![Tests](https://github.com/NeuralOperator/neuraloperator/actions/workflows/test.yml/badge.svg)](https://github.com/NeuralOperator/neuraloperator/actions/workflows/test.yml)
 
-.. image:: https://github.com/NeuralOperator/neuraloperator/actions/workflows/test.yml/badge.svg
-   :target: https://github.com/NeuralOperator/neuraloperator/actions/workflows/test.yml
+# Neural Operator
 
+**neuraloperator** is a comprehensive library for learning neural operators in PyTorch.
+It is the official implementation for **Fourier Neural Operators (FNO)** and 
+**Tensorized Neural Operators (TFNO)**.
 
-===============
-Neural Operator
-===============
+Unlike regular neural networks, neural operators enable learning mappings 
+between **function spaces**, providing a resolution-invariant framework 
+for tasks such as modeling partial differential equations (PDEs). 
+This library gives you all the necessary tools to build and train these 
+operators on your own datasets.
 
-``neuraloperator`` is a comprehensive library for 
-learning neural operators in PyTorch.
-It is the official implementation for Fourier Neural Operators 
-and Tensorized Neural Operators.
+---
 
-Unlike regular neural networks, neural operators
-enable learning mapping between function spaces, and this library
-provides all of the tools to do so on your own data.
+## New Feature: Image Parallelism (IP)
 
-NeuralOperators are also resolution invariant, 
-so your trained operator can be applied on data of any resolution.
+We now include an **image parallelism** module, inspired by the 
+[DeepSpeed Ulysses](https://github.com/microsoft/DeepSpeedExamples/tree/master/NewsQA) approach, 
+which enables large-scale distributed training for PDE-based tasks. 
 
+### How it works
 
-Installation
-------------
+1. **All-to-All Communication**: We perform **two all-to-all** operations around the FNO block 
+   (before and after) to distribute and gather image “patches” (or PDE field snapshots) 
+   across multiple GPUs. 
+2. **Scaling with Number of GPUs**: This design effectively partitions large images across 
+   available GPUs, allowing you to train on significantly larger image (or field) sizes 
+   than would fit on a single GPU.
 
-Just clone the repository and install locally (in editable mode so changes in the code are immediately reflected without having to reinstall):
+You can view the detailed implementation in 
+[`neuralop/layers/fno_block.py`](https://github.com/neuraloperator/neuraloperator_dist/blob/main/neuralop/layers/fno_block.py).
 
-prepare
+A convenient **one-click run** script, `python neural_ip.py`, is provided to demonstrate 
+image-parallel training on a sample PDE dataset. Give it a try to see how easily 
+you can scale up your NeuralOperator workflows!
 
-.. code::
+---
 
-  git clone https://github.com/wdlctc/tltorch
-  cd torch
-  pip install -e .
-  cd ..
+## Installation
 
-.. code::
+Clone the repository and install locally (in editable mode so that changes in 
+the code are immediately reflected without having to reinstall):
 
-  git clone https://github.com/wdlctc/neuraloperator
-  cd neuraloperator
-  pip install -e .
-  pip install -r requirements.txt
+### 1. Prepare `tltorch` (for tensorization features)
 
-You can also just pip install the library:
+```bash
+git clone https://github.com/wdlctc/tltorch
+cd tltorch
+pip install -e .
+cd ..
+```
 
+### 2. Install `neuraloperator`
 
-.. code::
-  
-  pip install neuraloperator
+```bash
+git clone https://github.com/wdlctc/neuraloperator
+cd neuraloperator
+pip install -e .
+pip install -r requirements.txt
+```
 
-Quickstart
-----------
+Alternatively, you can install via pip directly:
 
-After you've installed the library, you can start training operators seemlessly:
+```bash
+pip install neuraloperator
+```
 
+---
 
-.. code-block:: python
+## Quickstart
 
-   from neuralop.models import FNO
+After installation, you can start training operators seamlessly.
 
-   operator = FNO(n_modes=(16, 16), hidden_channels=64,
-                   in_channels=3, out_channels=1)
+### Fourier Neural Operator (FNO)
 
-Tensorization is also provided out of the box: you can improve the previous models
-by simply using a Tucker Tensorized FNO with just a few parameters:
+```python
+from neuralop.models import FNO
 
-.. code-block:: python
+operator = FNO(
+    n_modes=(16, 16),
+    hidden_channels=64,
+    in_channels=3,
+    out_channels=1
+)
+```
 
-   from neuralop.models import TFNO
+### Tensorized FNO (TFNO)
 
-   operator = TFNO(n_modes=(16, 16), hidden_channels=64,
-                   in_channels=3, 
-                   out_channels=1,
-                   factorization='tucker',
-                   implementation='factorized',
-                   rank=0.05)
+Using a **Tucker** factorization (just as an example) to drastically reduce parameters:
 
-This will use a Tucker factorization of the weights. The forward pass
-will be efficient by contracting directly the inputs with the factors
-of the decomposition. The Fourier layers will have 5% of the parameters
-of an equivalent, dense Fourier Neural Operator!
+```python
+from neuralop.models import TFNO
 
-Checkout the `documentation <https://neuraloperator.github.io/neuraloperator/dev/index.html>`_ for more!
+operator = TFNO(
+    n_modes=(16, 16),
+    hidden_channels=64,
+    in_channels=3,
+    out_channels=1,
+    factorization='tucker',
+    implementation='factorized',
+    rank=0.05
+)
+```
 
-Using with weights and biases
------------------------------
+By using a **Tucker** factorization, the model’s weight matrices are decomposed, 
+resulting in significantly fewer parameters while maintaining comparable performance. 
 
-Create a file in ``neuraloperator/config`` called ``wandb_api_key.txt`` and paste your Weights and Biases API key there.
-You can configure the project you want to use and your username in the main yaml configuration files.
+For comprehensive examples, check out the 
+[documentation](https://neuraloperator.github.io/neuraloperator/dev/index.html).
 
-Contributing code
------------------
+---
 
-All contributions are welcome! So if you spot a bug or even a typo or mistake in
-the documentation, please report it, and even better, open a Pull-Request on 
-`GitHub <https://github.com/neuraloperator/neuraloperator>`_. Before you submit
-your changes, you should make sure your code adheres to our style-guide. The
-easiest way to do this is with ``black``:
+## Running with Image Parallelism
 
-.. code::
+To run the **image parallelism** demo (inspired by **DeepSpeed Ulysses**), simply execute:
 
-   pip install black
-   black .
+```bash
+python neural_ip.py
+```
 
-Running the tests
-=================
+This script demonstrates how to distribute PDE field snapshots (or "images") 
+across multiple GPUs, enabling large-scale training and memory savings.
 
-Testing and documentation are an essential part of this package and all
-functions come with uni-tests and documentation. The tests are ran using the
-pytest package. First install ``pytest``:
+---
 
-.. code::
+## Using with Weights & Biases
 
-    pip install pytest
-    
-Then to run the test, simply run, in the terminal:
+Create a file named `wandb_api_key.txt` in `neuraloperator/config` and paste 
+your Weights & Biases API key inside. You can customize your project name and username 
+in the main YAML configuration files.
 
-.. code::
+---
 
-    pytest -v neuralop
-    
-Citing
-------
+## Contributing Code
 
-If you use NeuralOperator in an academic paper, please cite [1]_, [2]_::
+All contributions are welcome! If you spot a bug, typo, or any issue, 
+please report it or open a Pull Request on our 
+[GitHub](https://github.com/NeuralOperator/neuraloperator).
 
-   @misc{li2020fourier,
-      title={Fourier Neural Operator for Parametric Partial Differential Equations}, 
-      author={Zongyi Li and Nikola Kovachki and Kamyar Azizzadenesheli and Burigede Liu and Kaushik Bhattacharya and Andrew Stuart and Anima Anandkumar},
-      year={2020},
-      eprint={2010.08895},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
-   }
+Before submitting changes, ensure your code adheres to our style guide. 
+The easiest way is with [`black`](https://github.com/psf/black):
 
-   @article{kovachki2021neural,
-      author    = {Nikola B. Kovachki and
-                     Zongyi Li and
-                     Burigede Liu and
-                     Kamyar Azizzadenesheli and
-                     Kaushik Bhattacharya and
-                     Andrew M. Stuart and
-                     Anima Anandkumar},
-      title     = {Neural Operator: Learning Maps Between Function Spaces},
-      journal   = {CoRR},
-      volume    = {abs/2108.08481},
-      year      = {2021},
-   }
+```bash
+pip install black
+black .
+```
 
+---
 
-.. [1] Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K., Stuart, A., and Anandkumar A., “Fourier Neural Operator for Parametric Partial Differential Equations”, ICLR, 2021. doi:10.48550/arXiv.2010.08895.
+## Running the Tests
 
-.. [2] Kovachki, N., Li, Z., Liu, B., Azizzadenesheli, K., Bhattacharya, K., Stuart, A., and Anandkumar A., “Neural Operator: Learning Maps Between Function Spaces”, JMLR, 2021. doi:10.48550/arXiv.2108.08481.
+We use [`pytest`](https://docs.pytest.org/en/stable/) for testing. To run tests:
+
+```bash
+pip install pytest
+pytest -v neuralop
+```
+
+---
+
+## Citing
+
+If you use **NeuralOperator** in an academic paper, please cite the following:
+
+**[1]** Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K., 
+Stuart, A., and Anandkumar, A. *Fourier Neural Operator for Parametric 
+Partial Differential Equations*, ICLR, 2021.  
+[arXiv:2010.08895](https://arxiv.org/abs/2010.08895)
+
+**[2]** Kovachki, N., Li, Z., Liu, B., Azizzadenesheli, K., Bhattacharya, K., 
+Stuart, A., and Anandkumar, A. *Neural Operator: Learning Maps Between 
+Function Spaces*, JMLR, 2021.  
+[arXiv:2108.08481](https://arxiv.org/abs/2108.08481)
